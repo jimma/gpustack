@@ -158,6 +158,7 @@ __pycache__/
 */third_party/bin
 */ui/
 *.ma
+pack/downloads/
 
 # macOS
 .DS_Store
@@ -174,3 +175,6 @@ charts/gpustack-chart/charts/
 # avoid ignoring var in rootfs
 !/pack/rootfs/var
 !/pack/rootfs/var/**
+
+# Local Prometheus/Grafana/community-backends artifacts are vendored under
+# pack/downloads/ (already ignored above).

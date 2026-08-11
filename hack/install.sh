@@ -41,6 +41,17 @@ function download_ui() {
   rm -rf "${ui_path}"
   mkdir -p "${tmp_ui_path}/ui"
 
+  # If UI_LOCAL_PATH is set, copy UI assets from local path instead of downloading
+  if [[ -n "${UI_LOCAL_PATH:-}" ]]; then
+    gpustack::log::info "using local UI assets from '${UI_LOCAL_PATH}'"
+    if [[ ! -d "${UI_LOCAL_PATH}" ]]; then
+      gpustack::log::fatal "local UI path '${UI_LOCAL_PATH}' does not exist or is not a directory"
+    fi
+    cp -a "${UI_LOCAL_PATH}/." "${ui_path}"
+    rm -rf "${tmp_ui_path}"
+    return
+  fi
+
   gpustack::log::info "downloading '${tag}' UI assets"
 
   if ! curl --retry 3 --retry-connrefused --retry-delay 3 -sSfL "https://gpustack-ui-1303613262.cos.accelerate.myqcloud.com/releases/${tag}.tar.gz" 2>/dev/null |
@@ -72,22 +83,33 @@ function copy_extra_static() {
 
 # Update community backends
 function make_community_backends() {
-  local tmp_dir
-  tmp_dir=$(mktemp -d -t gpustack-community-backends.XXXXXX)
-
-  # shellcheck disable=SC2064
-  trap "rm -rf \"${tmp_dir}\"" EXIT
-
   local target_dir="${ROOT_DIR}/gpustack/assets/"
+  local cache_dir="${COMMUNITY_BACKENDS_CACHE_DIR:-${ROOT_DIR}/pack/downloads/community-inference-backends}"
+  local force_update="${COMMUNITY_BACKENDS_FORCE_UPDATE:-false}"
 
   gpustack::log::info "pulling community backends"
 
-  # Clone the repository
-  git clone https://github.com/gpustack/community-inference-backends "${tmp_dir}"
+  # If cache exists and force update is not requested, use cached copy
+  if [[ -d "${cache_dir}/.git" ]] && [[ "${force_update}" != "true" ]]; then
+    gpustack::log::info "using cached community backends from '${cache_dir}'"
+    (
+      cd "${cache_dir}"
+      # Pull latest changes
+      git pull --ff-only origin main 2>/dev/null || gpustack::log::warn "failed to update community backends cache, using existing copy"
+    )
+  else
+    # Clone or update the repository
+    if [[ -d "${cache_dir}/.git" ]]; then
+      gpustack::log::info "force updating community backends cache"
+      rm -rf "${cache_dir}"
+    fi
+    gpustack::log::info "cloning community backends to cache '${cache_dir}'"
+    git clone https://github.com/gpustack/community-inference-backends "${cache_dir}"
+  fi
 
-  # Build the community backends
+  # Build the community backends from cache
   (
-    cd "${tmp_dir}"
+    cd "${cache_dir}"
     if [[ "${UV_SYSTEM_PYTHON:-}" == "1" ]]; then
       # In Docker build, use system Python directly
       uv pip install PyYAML && uv run make
@@ -99,7 +121,7 @@ function make_community_backends() {
 
   # Create target directory and copy the yaml file
   mkdir -p "${target_dir}"
-  cp "${tmp_dir}/dist/community-inference-backends.yaml" "${target_dir}/community-inference-backends.yaml"
+  cp "${cache_dir}/dist/community-inference-backends.yaml" "${target_dir}/community-inference-backends.yaml"
 
   gpustack::log::info "community backends updated successfully"
 }

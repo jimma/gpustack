@@ -36,12 +36,12 @@ ARG GRAFANA_VERSION=12.2.4
 #   docker build --tag=gpustack/gpustack:base --file=pack/Dockerfile --target=base --progress=plain .
 #
 
-FROM gpustack/gpustack-operator:${GPUSTACK_OPERATOR_VERSION} AS gpustack-operator
-FROM gpustack/mirrored-higress-api-server:${HIGRESS_APISERVER_VERSION} AS apiserver
-FROM gpustack/mirrored-higress-higress:${HIGRESS_VERSION} AS controller
-FROM gpustack/mirrored-higress-pilot:${HIGRESS_VERSION} AS pilot
-FROM gpustack/mirrored-higress-gateway:${HIGRESS_VERSION} AS gateway
-FROM ubuntu:24.04@sha256:d1e2e92c075e5ca139d51a140fff46f84315c0fdce203eab2807c7e495eff4f9 AS base
+FROM docker.1panel.live/gpustack/gpustack-operator:${GPUSTACK_OPERATOR_VERSION} AS gpustack-operator
+FROM docker.1panel.live/gpustack/mirrored-higress-api-server:${HIGRESS_APISERVER_VERSION} AS apiserver
+FROM docker.1panel.live/gpustack/mirrored-higress-higress:${HIGRESS_VERSION} AS controller
+FROM docker.1panel.live/gpustack/mirrored-higress-pilot:${HIGRESS_VERSION} AS pilot
+FROM docker.1panel.live/gpustack/mirrored-higress-gateway:${HIGRESS_VERSION} AS gateway
+FROM docker.1panel.live/library/ubuntu:24.04@sha256:d1e2e92c075e5ca139d51a140fff46f84315c0fdce203eab2807c7e495eff4f9 AS base
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 
 ARG TARGETPLATFORM
@@ -54,6 +54,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LANG='en_US.UTF-8' \
     LANGUAGE='en_US:en' \
     LC_ALL='en_US.UTF-8'
+
+# Use Aliyun apt mirror for faster package downloads in China
+RUN sed -i 's|http://archive.ubuntu.com|http://mirrors.aliyun.com|g; s|http://ports.ubuntu.com|http://mirrors.aliyun.com|g; s|http://security.ubuntu.com|http://mirrors.aliyun.com|g' /etc/apt/sources.list.d/ubuntu.sources
 
 RUN <<EOF
     # Tools
@@ -253,6 +256,10 @@ EOF
 ## Install s6-overlay
 
 ARG S6_OVERLAY_VERSION=3.2.1.0
+
+# Pre-downloaded s6-overlay cache (optional, speeds up local builds)
+COPY pack/downloads/s6-overlay/ /tmp/s6-local/
+
 RUN set -eux; \
     case "${TARGETARCH}" in \
         amd64)   S6_ARCH="x86_64" ;; \
@@ -267,7 +274,14 @@ RUN set -eux; \
     echo "Installing s6-overlay ${S6_OVERLAY_VERSION} for arch: ${S6_ARCH} (from TARGETARCH=${TARGETARCH})"; \
     base_url="https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}"; \
     for pkg in noarch ${S6_ARCH}; do \
-        wget -q -O "/tmp/s6-overlay-${pkg}.tar.xz" "${base_url}/s6-overlay-${pkg}.tar.xz"; \
+        local_file="/tmp/s6-local/s6-overlay-${pkg}.tar.xz"; \
+        if [[ -s "${local_file}" ]]; then \
+            echo "Using cached s6-overlay: ${local_file}"; \
+            cp "${local_file}" "/tmp/s6-overlay-${pkg}.tar.xz"; \
+        else \
+            echo "Downloading s6-overlay-${pkg}.tar.xz ..."; \
+            wget -q -O "/tmp/s6-overlay-${pkg}.tar.xz" "${base_url}/s6-overlay-${pkg}.tar.xz"; \
+        fi; \
     done \
     && echo "📦  Extracting s6-overlay ..." \
     && tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz \
@@ -292,7 +306,7 @@ ENV S6_KEEP_ENV=1 \
 # Vendor ROCm libraries from ROCm base image.
 # Only the linux/amd64 ROCm source image is available, so pin the source
 # platform explicitly; the build host itself can be any platform.
-FROM --platform=linux/amd64 rocm/dev-ubuntu-22.04:${GPUSTACK_RUNTIME_ROCM_VERSION} AS rocm-base
+FROM --platform=linux/amd64 docker.1panel.live/rocm/dev-ubuntu-22.04:${GPUSTACK_RUNTIME_ROCM_VERSION} AS rocm-base
 
 FROM ${GPUSTACK_BASE_IMAGE} AS gpustack
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
@@ -318,41 +332,45 @@ RUN set -eux; \
 RUN <<EOF
     set -eux
 
-    # Add PostgreSQL APT repository
-    wget -O /tmp/ACCC4CF8.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-        && gpg --dearmor /tmp/ACCC4CF8.asc \
-        && mv /tmp/ACCC4CF8.asc.gpg /usr/share/keyrings/postgresql-archive-keyring.gpg \
-        && echo "deb [signed-by=/usr/share/keyrings/postgresql-archive-keyring.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+    # Add PostgreSQL APT repository (Aliyun mirror; TUNA/USTC lack noble-pgdg).
+    # NOTE: keep these as separate statements -- under `set -e`, a failure of a
+    # non-final command in an `a && b` chain does NOT abort the script, which
+    # previously masked apt failures and produced an empty image layer.
+    wget -O /tmp/ACCC4CF8.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+    gpg --dearmor /tmp/ACCC4CF8.asc
+    mv /tmp/ACCC4CF8.asc.gpg /usr/share/keyrings/postgresql-archive-keyring.gpg
+    echo "deb [signed-by=/usr/share/keyrings/postgresql-archive-keyring.gpg] https://mirrors.aliyun.com/postgresql/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
 
     # Install
-    apt-get update -y && apt-get install -y --no-install-recommends \
+    apt-get update -y
+    apt-get install -y --no-install-recommends \
         postgresql-17 \
         gosu
 
     # Create symlinks for PostgreSQL 17 to simplify usage
-    ln -s /usr/lib/postgresql/17/bin /usr/lib/postgresql/bin \
-        && ln -s /etc/postgresql/17/main /etc/postgresql/main \
-        && ln -s /var/lib/postgresql/17/main /var/lib/postgresql/main \
-        && ls -1 /usr/lib/postgresql/bin/ | xargs -I @ ln -sf /usr/lib/postgresql/bin/@ /usr/bin/@
+    ln -s /usr/lib/postgresql/17/bin /usr/lib/postgresql/bin
+    ln -s /etc/postgresql/17/main /etc/postgresql/main
+    ln -s /var/lib/postgresql/17/main /var/lib/postgresql/main
+    ls -1 /usr/lib/postgresql/bin/ | xargs -I @ ln -sf /usr/lib/postgresql/bin/@ /usr/bin/@
 
-    gosu postgres echo "listen_addresses='*'" >> "$PGCONFIG_FILE" \
-        && gosu postgres echo "local all  postgres            peer" > /etc/postgresql/main/pg_hba.conf \
-        && gosu postgres echo "host  all  root  127.0.0.1/32  trust" >> /etc/postgresql/main/pg_hba.conf \
-        && gosu postgres echo "host  all  root  ::1/128       trust" >> /etc/postgresql/main/pg_hba.conf \
-        && gosu postgres echo "host  all  all   0.0.0.0/0     scram-sha-256" >> /etc/postgresql/main/pg_hba.conf
+    gosu postgres echo "listen_addresses='*'" >> "$PGCONFIG_FILE"
+    gosu postgres echo "local all  postgres            peer" > /etc/postgresql/main/pg_hba.conf
+    gosu postgres echo "host  all  root  127.0.0.1/32  trust" >> /etc/postgresql/main/pg_hba.conf
+    gosu postgres echo "host  all  root  ::1/128       trust" >> /etc/postgresql/main/pg_hba.conf
+    gosu postgres echo "host  all  all   0.0.0.0/0     scram-sha-256" >> /etc/postgresql/main/pg_hba.conf
 
     # Logging: emit one file per calendar day with a readable date name and
     # disable size-based rotation so a busy day stays in a single file.
     # Postgres' own rotation never deletes old logs (that is what let them
     # grow to 18GB, issue #5774) — retention is enforced out-of-band by the
     # supercronic cleanup job in /var/lib/istio/cron.txt.
-    gosu postgres sed -i "s/^data_directory/#data_directory/" "$PGCONFIG_FILE" \
-        && gosu postgres sed -i "s/^hba_file/#hba_file/" "$PGCONFIG_FILE" \
-        && gosu postgres sed -i "s/^#log_destination/log_destination/" "$PGCONFIG_FILE" \
-        && gosu postgres sed -i "s/^#logging_collector = off/logging_collector = on/" "$PGCONFIG_FILE" \
-        && gosu postgres sed -i "s|^[# ]*log_filename.*|log_filename = 'postgresql-%Y-%m-%d.log'|" "$PGCONFIG_FILE" \
-        && gosu postgres sed -i "s|^[# ]*log_rotation_age.*|log_rotation_age = 1d|" "$PGCONFIG_FILE" \
-        && gosu postgres sed -i "s|^[# ]*log_rotation_size.*|log_rotation_size = 0|" "$PGCONFIG_FILE"
+    gosu postgres sed -i "s/^data_directory/#data_directory/" "$PGCONFIG_FILE"
+    gosu postgres sed -i "s/^hba_file/#hba_file/" "$PGCONFIG_FILE"
+    gosu postgres sed -i "s/^#log_destination/log_destination/" "$PGCONFIG_FILE"
+    gosu postgres sed -i "s/^#logging_collector = off/logging_collector = on/" "$PGCONFIG_FILE"
+    gosu postgres sed -i "s|^[# ]*log_filename.*|log_filename = 'postgresql-%Y-%m-%d.log'|" "$PGCONFIG_FILE"
+    gosu postgres sed -i "s|^[# ]*log_rotation_age.*|log_rotation_age = 1d|" "$PGCONFIG_FILE"
+    gosu postgres sed -i "s|^[# ]*log_rotation_size.*|log_rotation_size = 0|" "$PGCONFIG_FILE"
 
     # Cleanup
     rm -rf /var/tmp/* \
@@ -364,18 +382,19 @@ EOF
 
 ## Install Higress standalone components
 
-RUN --mount=type=bind,from=apiserver,source=/apiserver,dst=/mnt/apiserver,rw \
-    --mount=type=bind,from=controller,source=/usr/local/bin/higress,dst=/mnt/higress,rw \
-    --mount=type=bind,from=pilot,source=/usr/local/bin,dst=/mnt/pilot,rw \
+# Install API server and controller
+# NOTE: single-file `--mount=type=bind,from=<stage>,source=<file>` mounts do not
+# work with buildah (podman build) -- they silently produce empty files, which
+# later fail at runtime with "Permission denied" (exit 126). Use COPY --from,
+# which works identically under both BuildKit and buildah.
+COPY --from=apiserver /apiserver /usr/local/bin/apiserver
+COPY --from=controller /usr/local/bin/higress /usr/local/bin/higress
+
+RUN --mount=type=bind,from=pilot,source=/usr/local/bin,dst=/mnt/pilot,rw \
     --mount=type=bind,from=gateway,source=/,dst=/mnt/gateway,rw <<EOF
     # Prepare Higress standalone components
 
     set -eux;
-    # Install API server
-    cp /mnt/apiserver /usr/local/bin/apiserver;
-
-    # Install controller
-    cp /mnt/higress /usr/local/bin/higress;
 
     # Install pilot
     cp /mnt/pilot/pilot-discovery /usr/local/bin/pilot-discovery;
@@ -449,6 +468,11 @@ EOF
 
 ARG PROMETHEUS_VERSION
 ARG GRAFANA_VERSION
+## Local Prometheus/Grafana tarballs are vendored under pack/downloads/ (build context),
+## e.g. pack/downloads/prometheus/prometheus-3.5.1.linux-amd64.tar.gz,
+## pack/downloads/grafana/grafana-12.2.4.linux-amd64.tar.gz.
+COPY "pack/downloads/prometheus/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz" "/tmp/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+COPY "pack/downloads/grafana/grafana-${GRAFANA_VERSION}.linux-amd64.tar.gz" "/tmp/grafana-${GRAFANA_VERSION}.linux-amd64.tar.gz"
 RUN <<EOF
     set -eux
 
@@ -470,16 +494,15 @@ RUN <<EOF
             ;;
     esac
 
-    curl --retry 3 --retry-connrefused -fL \
-        "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-${PROM_ARCH}.tar.gz" \
-        | tar -zx -C /opt
+    ## Use the local Prometheus tarball (copied from the build context) instead of downloading.
+    tar -zx -C /opt -f "/tmp/prometheus-${PROMETHEUS_VERSION}.linux-${PROM_ARCH}.tar.gz"
     mv "/opt/prometheus-${PROMETHEUS_VERSION}.linux-${PROM_ARCH}" /opt/prometheus
     ln -s /opt/prometheus/prometheus /usr/local/bin/prometheus
     ln -s /opt/prometheus/promtool /usr/local/bin/promtool
 
-    curl --retry 3 --retry-connrefused -fL \
-        "https://dl.grafana.com/oss/release/grafana-${GRAFANA_VERSION}.linux-${GRAFANA_ARCH}.tar.gz" \
-        | tar -zx -C /opt
+    ## Use the local Grafana tarball (copied from the build context) instead of
+    ## downloading from https://dl.grafana.com, which is slow in China.
+    tar -zx -C /opt -f "/tmp/grafana-${GRAFANA_VERSION}.linux-${GRAFANA_ARCH}.tar.gz"
     mv "/opt/grafana-${GRAFANA_VERSION}" /opt/grafana
     ln -s /opt/grafana/bin/grafana-server /usr/local/bin/grafana-server
     ln -s /opt/grafana/bin/grafana-cli /usr/local/bin/grafana-cli
@@ -495,6 +518,7 @@ EOF
 ## Install GPUStack
 
 ARG UI_DOWNLOAD=true
+ARG UI_LOCAL_PATH=""
 
 RUN --mount=type=cache,target=/root/.cache \
     --mount=type=bind,target=/workspace/gpustack,rw <<EOF
@@ -505,6 +529,7 @@ RUN --mount=type=cache,target=/root/.cache \
     export UV_SYSTEM_PYTHON=1
     export UV_LINK_MODE=copy
     export UI_DOWNLOAD=${UI_DOWNLOAD}
+    export UI_LOCAL_PATH=${UI_LOCAL_PATH}
 
     # Build GPUStack
     cd /workspace/gpustack \

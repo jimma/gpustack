@@ -1,0 +1,1 @@
+GPUSTACK_GATEWAY_MODE=disabled GPUSTACK_DATABASE_URL="postgresql://gpustack:Suanova123@127.0.0.1:5432/gpustack"  gpustack start --port 30080  --data-dir "./gpustack-data"  --bootstrap-password "Suanova@123"
