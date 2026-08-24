@@ -36,12 +36,12 @@ ARG GRAFANA_VERSION=12.2.4
 #   docker build --tag=gpustack/gpustack:base --file=pack/Dockerfile --target=base --progress=plain .
 #
 
-FROM docker.1panel.live/gpustack/gpustack-operator:${GPUSTACK_OPERATOR_VERSION} AS gpustack-operator
-FROM docker.1panel.live/gpustack/mirrored-higress-api-server:${HIGRESS_APISERVER_VERSION} AS apiserver
-FROM docker.1panel.live/gpustack/mirrored-higress-higress:${HIGRESS_VERSION} AS controller
-FROM docker.1panel.live/gpustack/mirrored-higress-pilot:${HIGRESS_VERSION} AS pilot
-FROM docker.1panel.live/gpustack/mirrored-higress-gateway:${HIGRESS_VERSION} AS gateway
-FROM docker.1panel.live/library/ubuntu:24.04@sha256:d1e2e92c075e5ca139d51a140fff46f84315c0fdce203eab2807c7e495eff4f9 AS base
+FROM harbor.isuanova.com/gpustack/gpustack-operator:${GPUSTACK_OPERATOR_VERSION} AS gpustack-operator
+FROM harbor.isuanova.com/gpustack/mirrored-higress-api-server:${HIGRESS_APISERVER_VERSION} AS apiserver
+FROM harbor.isuanova.com/gpustack/mirrored-higress-higress:${HIGRESS_VERSION} AS controller
+FROM harbor.isuanova.com/gpustack/mirrored-higress-pilot:${HIGRESS_VERSION} AS pilot
+FROM harbor.isuanova.com/gpustack/mirrored-higress-gateway:${HIGRESS_VERSION} AS gateway
+FROM harbor.isuanova.com/library/ubuntu:24.04 AS base
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 
 ARG TARGETPLATFORM
@@ -306,7 +306,7 @@ ENV S6_KEEP_ENV=1 \
 # Vendor ROCm libraries from ROCm base image.
 # Only the linux/amd64 ROCm source image is available, so pin the source
 # platform explicitly; the build host itself can be any platform.
-FROM --platform=linux/amd64 docker.1panel.live/rocm/dev-ubuntu-22.04:${GPUSTACK_RUNTIME_ROCM_VERSION} AS rocm-base
+FROM --platform=linux/amd64 harbor.isuanova.com/rocm/dev-ubuntu-22.04:${GPUSTACK_RUNTIME_ROCM_VERSION} AS rocm-base
 
 FROM ${GPUSTACK_BASE_IMAGE} AS gpustack
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
@@ -416,21 +416,39 @@ COPY docker-compose/grafana/grafana_dashboards/ /etc/dashboards/
 
 ## Install Skopeo
 
-ARG GOPROXY="https://proxy.golang.org,direct"
+ARG GOPROXY="https://goproxy.cn,direct"
+
+# Pre-bundled Go toolchain + skopeo v1.20.0 source (pack/downloads/), used when
+# present so the build works without reaching go.dev / github.com.
+COPY pack/downloads/go/ /tmp/go-local/
+COPY pack/downloads/skopeo/skopeo /tmp/skopeo-local/
 
 RUN <<EOF
     # Skopeo
 
-    # Install Go
-    curl --retry 3 --retry-connrefused -fL "https://go.dev/dl/go1.23.3.${TARGETOS}-${TARGETARCH}.tar.gz" | tar -zx -C /usr/local
+    # Install Go (bundled tarball preferred; online fallback)
+    GO_TARBALL="/tmp/go-local/go1.23.3.${TARGETOS}-${TARGETARCH}.tar.gz"
+    if [[ -f "${GO_TARBALL}" ]]; then
+        echo "Using bundled Go toolchain: ${GO_TARBALL}"
+        tar -zx -C /usr/local -f "${GO_TARBALL}"
+    else
+        echo "No bundled Go for ${TARGETOS}/${TARGETARCH}; downloading from go.dev..."
+        curl --retry 3 --retry-connrefused -fL "https://go.dev/dl/go1.23.3.${TARGETOS}-${TARGETARCH}.tar.gz" | tar -zx -C /usr/local
+    fi
     export PATH="/usr/local/go/bin:${PATH}"
     export GOPROXY="${GOPROXY}"
     export
 
-    # Download
-    git -C /tmp clone --recursive --shallow-submodules \
-        --depth 1 --branch v1.20.0 --single-branch \
-        https://github.com/containers/skopeo.git skopeo
+    # Skopeo source: bundled copy preferred; online git clone fallback
+    if [[ -f "/tmp/skopeo-local/Makefile" ]]; then
+        echo "Using bundled skopeo source: /tmp/skopeo-local"
+        cp -a /tmp/skopeo-local /tmp/skopeo
+    else
+        echo "No bundled skopeo source; cloning from github.com..."
+        git -C /tmp clone --recursive --shallow-submodules \
+            --depth 1 --branch v1.20.0 --single-branch \
+            https://github.com/containers/skopeo.git skopeo
+    fi
 
     # Build and install
     pushd /tmp/skopeo \
@@ -520,6 +538,11 @@ EOF
 ARG UI_DOWNLOAD=true
 ARG UI_LOCAL_PATH=""
 
+# Bundled worker dependency tools (pack/downloads/tools/): gguf-parser + fastfetch,
+# one tar per arch. If the matching archive is absent, the build falls back to an
+# online `gpustack download-tools` (and still hard-fails if tools end up missing).
+COPY pack/downloads/tools/ /tmp/gpustack-tools/
+
 RUN --mount=type=cache,target=/root/.cache \
     --mount=type=bind,target=/workspace/gpustack,rw <<EOF
     # Install GPUStack
@@ -540,9 +563,26 @@ RUN --mount=type=cache,target=/root/.cache \
     uv pip install --no-build-isolation --extra-index-url https://download.pytorch.org/whl/cpu/ \
         /workspace/gpustack/dist/*.whl
 
-    # Download tools
-    gpustack download-tools
-    tree -hs "$(pip show gpustack | grep Location: | head -n 1 | cut -d" " -f 2)/gpustack/third_party"
+    # Download tools: prefer the bundled offline archive; fall back to an online
+    # download only when no archive for this TARGETARCH is bundled.
+    TOOLS_ARCHIVE="/tmp/gpustack-tools/gpustack-tools-linux-${TARGETARCH}.tar.gz"
+    if [[ -f "${TOOLS_ARCHIVE}" ]]; then
+        echo "Loading bundled dependency tools: ${TOOLS_ARCHIVE}"
+        gpustack download-tools --load-archive "${TOOLS_ARCHIVE}"
+    else
+        echo "No bundled tools for linux/${TARGETARCH}; downloading from internet..."
+        gpustack download-tools
+    fi
+
+    # Hard gate: worker requires gguf-parser + fastfetch at runtime. Fail the
+    # build if either is missing (prevents shipping an image whose worker will
+    # loop on network-dependent tool downloads).
+    TOOLS_BIN="$(pip show gpustack | grep Location: | head -n 1 | cut -d" " -f 2)/gpustack/third_party/bin"
+    for t in gguf-parser/gguf-parser fastfetch/fastfetch; do
+        test -x "${TOOLS_BIN}/${t}" || { echo "ERROR: ${t} missing after tools setup (${TOOLS_BIN})"; exit 1; }
+    done
+    echo "Dependency tools verified: gguf-parser + fastfetch present in ${TOOLS_BIN}"
+    tree -hs "${TOOLS_BIN}"
 
     # Set up environment
     mkdir -p /var/lib/gpustack \

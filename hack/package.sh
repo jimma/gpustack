@@ -48,6 +48,14 @@ function pack() {
 
     gpustack::log::info "using container runtime: ${runtime}"
 
+    # PACKAGE_NO_CACHE=true disables build cache reuse (use when the build cache
+    # is corrupted by an interrupted build and podman fails with missing layers).
+    NO_CACHE_FLAG=""
+    if [[ "${PACKAGE_NO_CACHE:-false}" == "true" ]]; then
+        NO_CACHE_FLAG="--no-cache"
+        gpustack::log::info "PACKAGE_NO_CACHE=true: rebuilding all layers from scratch"
+    fi
+
     LABELS=("org.opencontainers.image.source=https://github.com/gpustack/gpustack" "org.opencontainers.image.version=main" "org.opencontainers.image.revision=$(git rev-parse HEAD 2>/dev/null || echo "unknown")" "org.opencontainers.image.created=$(date +"%Y-%m-%dT%H:%M:%S.%s")");
     TAG="${PACKAGE_NAMESPACE}/${PACKAGE_REPOSITORY}:${PACKAGE_TAG}"
 
@@ -106,7 +114,8 @@ function pack() {
     set -x
     if [[ "${runtime}" == "docker" ]]; then
         docker buildx build \
-            --pull \
+            --pull=missing \
+            ${NO_CACHE_FLAG} \
             --allow network.host \
             --allow security.insecure \
             --builder "gpustack" \
@@ -122,8 +131,14 @@ function pack() {
             "${docker_extra_args[@]}" \
             "${ROOT_DIR}"
     else
+        # --format docker: podman's default OCI image format ignores the
+        # Dockerfile SHELL instruction (heredoc RUNs then run under /bin/sh,
+        # breaking bash-only syntax like [[, pushd, source). Force docker format
+        # so SHELL takes effect, exactly like `docker build`.
         podman build \
-            --pull \
+            --format docker \
+            --pull=missing \
+            ${NO_CACHE_FLAG} \
             --platform "linux/${PACKAGE_ARCH}" \
             --tag "${TAG}" \
             --file "${ROOT_DIR}/pack/Dockerfile" \
