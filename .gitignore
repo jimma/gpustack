@@ -158,7 +158,8 @@ __pycache__/
 */third_party/bin
 */ui/
 *.ma
-pack/downloads/
+pack/downloads/*
+!pack/downloads/README.md
 
 # macOS
 .DS_Store
