@@ -372,6 +372,14 @@ RUN <<EOF
     gosu postgres sed -i "s|^[# ]*log_rotation_age.*|log_rotation_age = 1d|" "$PGCONFIG_FILE"
     gosu postgres sed -i "s|^[# ]*log_rotation_size.*|log_rotation_size = 0|" "$PGCONFIG_FILE"
 
+    # Debian postgresql-17 包默认把 /etc/postgresql/17/main 置为 root:root 0700，
+    # 而运行期 s6 postgres 服务用 gosu postgres 读取/修改配置（sed -i postgresql.conf、
+    # postgres -c config_file=...），必须恢复为 postgres 属主（与 dev 镜像一致），
+    # 否则容器内 postgres 无法启动、应用 crash-loop。
+    chmod 0755 /etc/postgresql /etc/postgresql/17 /etc/postgresql/17/main
+    chown -R postgres:postgres /etc/postgresql/17/main
+    chmod 0640 /etc/postgresql/17/main/*
+
     # Cleanup
     rm -rf /var/tmp/* \
         && rm -rf /tmp/* \
